@@ -80,6 +80,18 @@ impl Report {
         self.findings.is_empty()
     }
 
+    /// Название работающего средства обхода DPI, если оно есть.
+    ///
+    /// Нужно именно название: пока такое средство работает, вывод «блокировок
+    /// не найдено» ничего не значит — оно для того и запущено, чтобы фильтр
+    /// не сработал.
+    pub fn dpi_bypass_name(&self) -> Option<&str> {
+        self.findings
+            .iter()
+            .find(|f| f.kind == BypassKind::DpiBypass)
+            .map(|f| f.name.as_str())
+    }
+
     /// Короткая сводка для строки отчёта.
     pub fn summary(&self) -> String {
         if self.findings.is_empty() {
@@ -296,5 +308,23 @@ mod tests {
     #[test]
     fn empty_report_says_so_plainly() {
         assert!(Report::default().summary().contains("не обнаружено"));
+    }
+
+    /// Работающий обход DPI обязан быть виден отдельно от VPN и прокси:
+    /// именно он обесценивает вывод «блокировок не найдено».
+    #[test]
+    fn dpi_bypass_is_reported_apart_from_tunnels() {
+        let report = Report {
+            findings: vec![
+                finding("Туннель", BypassKind::Vpn, Confidence::Found),
+                finding("zapret (winws)", BypassKind::DpiBypass, Confidence::Found),
+            ],
+        };
+        assert_eq!(report.dpi_bypass_name(), Some("zapret (winws)"));
+
+        let only_vpn = Report {
+            findings: vec![finding("Туннель", BypassKind::Vpn, Confidence::Found)],
+        };
+        assert_eq!(only_vpn.dpi_bypass_name(), None);
     }
 }

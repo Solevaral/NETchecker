@@ -191,7 +191,10 @@ impl NodeState {
 #[derive(Debug, Clone)]
 pub struct CheckResult {
     /// Стабильный идентификатор, по нему UI обновляет уже показанную строку.
-    pub id: &'static str,
+    ///
+    /// Строка, а не константа: часть проверок заводится по списку целей,
+    /// который задаёт пользователь, и заранее их имена неизвестны.
+    pub id: String,
     pub layer: Layer,
     pub node: NodeId,
     pub status: Status,
@@ -206,9 +209,14 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
-    pub fn new(id: &'static str, layer: Layer, node: NodeId, title: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        layer: Layer,
+        node: NodeId,
+        title: impl Into<String>,
+    ) -> Self {
         Self {
-            id,
+            id: id.into(),
             layer,
             node,
             status: Status::Running,

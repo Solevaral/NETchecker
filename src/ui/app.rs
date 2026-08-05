@@ -267,7 +267,7 @@ impl App {
                 egui::CollapsingHeader::new(
                     RichText::new(head).color(theme::status_color(check.status)),
                 )
-                .id_salt(check.id)
+                .id_salt(&check.id)
                 .show(ui, |ui| {
                     let text = if self.expert && !check.expert.is_empty() {
                         &check.expert

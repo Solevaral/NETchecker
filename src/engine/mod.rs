@@ -11,9 +11,12 @@
 //! Всё выполняется в отдельном потоке и рапортует в UI через [`Reporter`].
 
 pub mod bypass;
+pub mod censorship;
+pub mod dns;
 pub mod icmp;
 pub mod l1_l2;
 pub mod probe;
+pub mod tls;
 pub mod trace;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -38,6 +41,34 @@ const ANCHORS: [(&str, Ipv4Addr); 3] = [
 /// Домены для проверки прикладного уровня.
 const SITES: [&str; 2] = ["ya.ru", "example.com"];
 
+/// Сайты, на которых проверяются блокировки.
+///
+/// Список намеренно смешанный: есть заведомо доступные в России и есть те,
+/// с которыми у российских пользователей обычно бывают проблемы. Смысл именно
+/// в сравнении — если перестают открываться только вторые, причина не в
+/// подключении. Позже список станет пользовательским.
+const TARGETS: [&str; 5] = [
+    "ya.ru",
+    "example.com",
+    "www.google.com",
+    "discord.com",
+    "www.youtube.com",
+];
+
+/// Имя, которое подставляется вместо настоящего, чтобы отделить «сервер не
+/// отвечает» от «не пускают именно это имя».
+const NEUTRAL_SNI: &str = "example.org";
+
+/// DoH-серверы задаются числовыми адресами: если DNS сломан или подменён,
+/// разрешать имя самого DoH-сервера было бы замкнутым кругом. Сертификаты
+/// обоих серверов выписаны в том числе на их адреса.
+const DOH_ENDPOINTS: [&str; 2] = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"];
+
+/// Адрес из диапазона, зарезервированного для документации: там заведомо нет
+/// и не может быть DNS-сервера. Ответ от него означает, что запросы к порту 53
+/// перехватывает провайдер.
+const NOWHERE_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+
 const TIMEOUT: Duration = Duration::from_secs(4);
 const PING_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -46,7 +77,7 @@ const PING_TIMEOUT: Duration = Duration::from_millis(1500);
 const PING_COUNT: usize = 4;
 
 /// Всего шагов в конвейере — должно совпадать с числом вызовов `progress`.
-const STEPS: usize = 6;
+const STEPS: usize = 7;
 
 /// Запускает диагностику в фоне. Вызывающий продолжает рисовать окно.
 pub fn spawn(caps: Capabilities, rep: Reporter) {
@@ -86,6 +117,23 @@ fn run(caps: Capabilities, rep: &Reporter) {
     rep.progress(5, "Проверяю имена сайтов и соединение с ними…");
     let dns_ok = check_dns_and_sites(rep, &link);
 
+    rep.progress(6, "Проверяю блокировки…");
+    let transit = if dns_ok && reachable_anchor.is_some() {
+        check_censorship(rep, &link, &bypass)
+    } else {
+        // Без работающего интернета пробы на блокировки ничего не покажут:
+        // всё будет обрываться по совсем другой причине.
+        rep.check(
+            CheckResult::new("l7.filter", Layer::L7Application, NodeId::Dpi, "Блокировки")
+                .finish(
+                    Status::Skipped,
+                    "Проверка блокировок пропущена: сначала нужно, чтобы работал сам интернет.",
+                    "Нет доступа к опорным узлам или к DNS — пробы неотличимы от общего обрыва.",
+                ),
+        );
+        censorship::Transit::default()
+    };
+
     rep.progress(STEPS, "Готово");
     rep.send(EngineEvent::Finished(Box::new(verdict(Observations {
         link: &link,
@@ -94,6 +142,7 @@ fn run(caps: Capabilities, rep: &Reporter) {
         anchors_ok: reachable_anchor.is_some(),
         route: &route,
         dns_ok,
+        transit: &transit,
     }))));
 }
 
@@ -397,8 +446,8 @@ fn check_route(
         filter.finish(
             Status::Ok,
             "На пути до интернета оборудование не блокирует трафик — маршрут прошёл целиком.",
-            "Трассировка дошла до цели, ICMP-запретов по пути нет. Проверка блокировок \
-             по имени сайта и по SNI появится на следующем этапе.",
+            "Трассировка дошла до цели, ICMP-запретов по пути нет. Фильтрация по имени \
+             сайта проверяется отдельно — она на трассировке не видна.",
         )
     } else if let Some(hop) = result.break_after() {
         let addr = hop.address.map(|a| a.to_string()).unwrap_or_default();
@@ -466,7 +515,8 @@ fn check_dns_and_sites(rep: &Reporter, link: &l1_l2::LinkInfo) -> bool {
         dns.finish(
             Status::Ok,
             "Имена сайтов превращаются в адреса — DNS работает.",
-            "Системный резолвер вернул адреса. Сравнение с DoH и проверка подмены — следующий этап.",
+            "Системный резолвер вернул адреса. Сравнение с эталонным ответом по HTTPS \
+             идёт отдельно, по каждому проверяемому сайту.",
         )
     } else {
         dns.finish(
@@ -512,6 +562,223 @@ fn check_dns_and_sites(rep: &Reporter, link: &l1_l2::LinkInfo) -> bool {
     rep.check(conn);
 
     resolved_any
+}
+
+/// Проверка блокировок: сравнение DNS и пробы по имени сайта.
+fn check_censorship(
+    rep: &Reporter,
+    link: &l1_l2::LinkInfo,
+    bypass: &bypass::Report,
+) -> censorship::Transit {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(6)))
+        .build()
+        .into();
+
+    check_dns_interception(rep, link);
+
+    let mut probes = Vec::new();
+    let mut findings = Vec::new();
+
+    for (index, domain) in TARGETS.iter().enumerate() {
+        rep.progress(
+            6,
+            format!("Проверяю блокировки: {domain} ({}/{})", index + 1, TARGETS.len()),
+        );
+
+        let probe = probe_target(&agent, link, domain);
+        let finding = censorship::judge(&probe);
+
+        let status = match finding.verdict {
+            censorship::Verdict::Reachable => Status::Ok,
+            censorship::Verdict::Unclear => Status::Skipped,
+            censorship::Verdict::SiteDown => Status::Warn,
+            _ => Status::Fail,
+        };
+
+        let check = CheckResult::new(
+            format!("l7.target.{}", finding.domain),
+            Layer::L7Application,
+            NodeId::Target,
+            format!("{} — {}", finding.domain, finding.verdict.headline()),
+        )
+        .finish(status, finding.simple.clone(), finding.expert.clone());
+        rep.check(
+            finding
+                .evidence
+                .iter()
+                .fold(check, |c, e| c.with_evidence(e.clone())),
+        );
+
+        probes.push(probe);
+        findings.push(finding);
+    }
+
+    let transit = censorship::transit_signals(&probes, &findings);
+
+    let check = CheckResult::new(
+        "l7.filter",
+        Layer::L7Application,
+        NodeId::Dpi,
+        "Фильтрация по имени сайта",
+    );
+    let check = if transit.is_confident() {
+        rep.node(NodeId::Dpi, "фильтрует по имени сайта", None);
+        check.finish(Status::Fail, transit.simple(), transit.expert())
+    } else if transit.has_signals() {
+        rep.node(NodeId::Dpi, "есть отдельные признаки", None);
+        check.finish(Status::Warn, transit.simple(), transit.expert())
+    } else if let Some(tool) = bypass.dpi_bypass_name() {
+        // Обход как раз и занимается тем, что мешает фильтру увидеть имя
+        // сайта. Пока он работает, отсутствие блокировок ничего не доказывает,
+        // и говорить «блокировок нет» было бы прямой неправдой.
+        rep.node(NodeId::Dpi, "скрыто работающим обходом", None);
+        check.finish(
+            Status::Warn,
+            format!(
+                "Ни один сайт не обрывается по имени, но у вас работает {tool} — средство, \
+                 которое как раз и прячет имя сайта от фильтра. Пока оно включено, сказать, \
+                 есть блокировки или нет, невозможно. Чтобы проверить, отключите его \
+                 и повторите."
+            ),
+            format!(
+                "{} Результат снят при активном обходе DPI, поэтому отрицательный вывод \
+                 недостоверен.",
+                transit.expert()
+            ),
+        )
+    } else {
+        check.finish(
+            Status::Ok,
+            "Ни один из проверенных сайтов не обрывается из-за своего имени — фильтрации \
+             по имени не видно.",
+            transit.expert(),
+        )
+    };
+    rep.check(check);
+
+    transit
+}
+
+/// Собирает всё, что нужно знать об одном сайте.
+fn probe_target(agent: &ureq::Agent, link: &l1_l2::LinkInfo, domain: &str) -> censorship::Probe {
+    let mut probe = censorship::Probe::new(domain);
+
+    // Эталон: ответ, который провайдер не может подменить.
+    for endpoint in DOH_ENDPOINTS {
+        if let Ok(answer) = dns::query_doh(agent, endpoint, domain) {
+            probe.doh = Some(answer);
+            break;
+        }
+    }
+
+    // Ответ того сервера, который назначила система.
+    if let Some(server) = link.dns_servers.first() {
+        probe.system_dns = dns::query_udp(*server, domain, Duration::from_secs(3)).ok();
+    }
+
+    // Пробы идут на адрес из DoH: он заведомо настоящий.
+    probe.address = probe
+        .doh
+        .as_ref()
+        .and_then(|a| a.addresses.first().copied())
+        .or_else(|| {
+            probe
+                .system_dns
+                .as_ref()
+                .and_then(|a| a.addresses.first().copied())
+        });
+
+    let Some(address) = probe.address else {
+        return probe;
+    };
+
+    // Опорное время: быстрее этого сам сервер ответить не может.
+    if let TcpOutcome::Open { rtt } =
+        tcp_connect(SocketAddr::new(IpAddr::V4(address), 443), TIMEOUT)
+    {
+        probe.baseline = Some(rtt);
+    }
+
+    let real = tls::probe(address, 443, domain, tls::Delivery::Whole, TIMEOUT);
+    let broken = real.is_broken();
+    probe.real_sni = Some(real);
+    probe.neutral_sni = Some(tls::probe(
+        address,
+        443,
+        NEUTRAL_SNI,
+        tls::Delivery::Whole,
+        TIMEOUT,
+    ));
+
+    // Разделять пакет имеет смысл только там, где целый не прошёл.
+    if broken {
+        probe.split_sni = Some(tls::probe(
+            address,
+            443,
+            domain,
+            tls::Delivery::Split,
+            TIMEOUT,
+        ));
+    }
+
+    probe
+}
+
+/// Перехватывает ли провайдер обращения к чужим DNS-серверам.
+///
+/// Спрашиваем адрес, на котором заведомо никого нет. Настоящего ответа быть
+/// не может — если он пришёл, значит запрос перехватили по дороге.
+fn check_dns_interception(rep: &Reporter, link: &l1_l2::LinkInfo) {
+    let check = CheckResult::new(
+        "l7.dns.intercept",
+        Layer::L7Application,
+        NodeId::Provider,
+        "Перехват DNS-запросов",
+    );
+
+    let outcome = dns::query_udp(
+        IpAddr::V4(NOWHERE_RESOLVER),
+        "example.com",
+        Duration::from_secs(2),
+    );
+
+    let check = match outcome {
+        Ok(answer) => check
+            .finish(
+                Status::Warn,
+                format!(
+                    "Провайдер перехватывает запросы к DNS-серверам: ответ пришёл от адреса \
+                     {NOWHERE_RESOLVER}, где никакого сервера нет. Значит смена DNS в настройках \
+                     ничего не изменит — отвечать всё равно будет провайдер."
+                ),
+                format!(
+                    "Запрос к {NOWHERE_RESOLVER}:53 получил ответ: {}. Адрес принадлежит \
+                     диапазону для документации, работающего резолвера там быть не может.",
+                    answer.describe()
+                ),
+            )
+            .with_evidence(format!("ответ от {NOWHERE_RESOLVER}: {}", answer.describe())),
+        Err(_) => check.finish(
+            Status::Ok,
+            "Запросы к DNS-серверам не перехватываются: можно менять DNS в настройках, \
+             и это будет иметь смысл.",
+            format!(
+                "Запрос к {NOWHERE_RESOLVER}:53 остался без ответа, как и должно быть. \
+                 Системные серверы: {}.",
+                if link.dns_servers.is_empty() {
+                    "не сообщены".to_string()
+                } else {
+                    link.dns_servers
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+        ),
+    };
+    rep.check(check);
 }
 
 /// Результат серии эхо-запросов к одному адресу.
@@ -600,6 +867,7 @@ struct Observations<'a> {
     anchors_ok: bool,
     route: &'a trace::Trace,
     dns_ok: bool,
+    transit: &'a censorship::Transit,
 }
 
 /// Сведение наблюдений в один понятный вывод.
@@ -727,6 +995,25 @@ fn verdict(o: Observations<'_>) -> Diagnosis {
         };
     }
 
+    // Фильтрация по имени сайта — отдельный исход: интернет при этом работает,
+    // и говорить «интернета нет» было бы неправдой.
+    if o.transit.is_confident() {
+        return Diagnosis {
+            headline: "Интернет работает, но часть сайтов блокируют".into(),
+            simple: format!(
+                "{} Само подключение исправно: роутер, провайдер и интернет отвечают.",
+                o.transit.simple()
+            ),
+            expert: o.transit.expert(),
+            actions: tunnel_note(vec![
+                "Это не поломка вашего оборудования — перезагрузка роутера не поможет.".into(),
+                "Сайты, которые не открываются, перечислены в разделе «Уровни OSI».".into(),
+            ]),
+            break_edge: Some((NodeId::Dpi, NodeId::Target)),
+            status: Status::Warn,
+        };
+    }
+
     let mut actions = Vec::new();
     if !o.bypass.is_empty() {
         actions.push(format!(
@@ -734,21 +1021,50 @@ fn verdict(o: Observations<'_>) -> Diagnosis {
             o.bypass.summary()
         ));
     }
+    if o.transit.has_signals() {
+        actions.push(
+            "Один сайт не открывается из-за своего имени. Одного случая мало для выводов — \
+             посмотрите подробности в разделе «Уровни OSI»."
+                .to_string(),
+        );
+    }
+
+    // Вывод «блокировок нет» при работающем обходе был бы неправдой: обход
+    // для того и запущен, чтобы фильтр не сработал.
+    let hidden_by = o.bypass.dpi_bypass_name();
+    if let Some(tool) = hidden_by {
+        actions.push(format!(
+            "Чтобы узнать, есть ли блокировки на самом деле, отключите {tool} и повторите \
+             проверку."
+        ));
+    }
+
+    let clean = o.bypass.is_empty() && !o.transit.has_signals();
 
     Diagnosis {
         headline: "Интернет работает".into(),
-        simple: "Подключение, роутер, выход в интернет и имена сайтов — всё отвечает.".into(),
+        simple: match hidden_by {
+            Some(tool) => format!(
+                "Подключение, роутер, выход в интернет и сайты — всё отвечает. Но у вас \
+                 работает {tool}, поэтому проверить, блокирует ли что-то провайдер, \
+                 сейчас нельзя."
+            ),
+            None => "Подключение, роутер, выход в интернет, имена сайтов и сами сайты — \
+                     всё отвечает."
+                .to_string(),
+        },
         expert: format!(
-            "L1–L4 и разрешение имён в норме, маршрут построен на {} узлов. Проверки \
-             на блокировки, подмену DNS и замедление появятся на следующих этапах.",
-            o.route.hops.len()
+            "L1–L7 в норме, маршрут построен на {} узлов. {}{}",
+            o.route.hops.len(),
+            o.transit.expert(),
+            if hidden_by.is_some() {
+                " Отрицательный вывод о блокировках недостоверен: активен обход DPI."
+            } else {
+                ""
+            }
         ),
         actions: tunnel_note(actions),
         break_edge: None,
-        status: if o.bypass.is_empty() {
-            Status::Ok
-        } else {
-            Status::Warn
-        },
+        status: if clean { Status::Ok } else { Status::Warn },
     }
 }
