@@ -145,6 +145,8 @@ impl App {
     }
 
     fn overview(&mut self, ui: &mut egui::Ui) {
+        self.bypass_banner(ui);
+
         if let Some(node) = topology::show(ui, &self.report) {
             self.focus = if self.focus == Some(node) {
                 None
@@ -156,6 +158,38 @@ impl App {
 
         ui.add_space(6.0);
         self.verdict_card(ui);
+    }
+
+    /// Полоса с найденными VPN, прокси и средствами обхода.
+    ///
+    /// Показывается над схемой, а не в общем списке проверок, потому что она
+    /// меняет смысл всего остального: если трафик уходит в туннель, схема
+    /// описывает канал туннеля, а не подключение пользователя.
+    fn bypass_banner(&self, ui: &mut egui::Ui) {
+        let Some(check) = self.report.checks.iter().find(|c| c.id == "l2.bypass") else {
+            return;
+        };
+
+        let color = theme::status_color(check.status);
+        card(ui, color, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Обходы и туннели").color(color).strong());
+                ui.label(
+                    RichText::new(format!("[{}]", check.status.glyph()))
+                        .color(color)
+                        .small(),
+                );
+            });
+            ui.add_space(2.0);
+            ui.label(RichText::new(&check.simple).color(theme::TEXT));
+
+            // Каждая находка отдельной строкой: человеку важно видеть, что
+            // именно нашли и по какому признаку.
+            for line in &check.evidence {
+                ui.label(RichText::new(format!("• {line}")).color(theme::TEXT_DIM).small());
+            }
+        });
+        ui.add_space(6.0);
     }
 
     fn verdict_card(&self, ui: &mut egui::Ui) {

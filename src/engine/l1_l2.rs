@@ -20,22 +20,32 @@ pub struct LinkInfo {
     pub gateway: Option<IpAddr>,
     /// DNS-серверы, выданные системой.
     pub dns_servers: Vec<IpAddr>,
-    /// Похоже, что трафик идёт через VPN — результаты будут про VPN, а не про канал.
-    pub through_vpn: bool,
+    /// Все интерфейсы: нужны поиску средств обхода, чтобы не опрашивать
+    /// систему второй раз.
+    pub interfaces: Vec<Interface>,
+    /// Маршрут по умолчанию уходит в туннель.
+    pub default_is_tunnel: bool,
+    /// Собственные адреса — по ним трассировка отличает домашнюю сеть
+    /// от частных адресов внутри сети провайдера.
+    pub local_v4: Vec<Ipv4Addr>,
 }
 
 pub fn run(rep: &Reporter) -> LinkInfo {
     let interfaces = netdev::get_interfaces();
     let default = netdev::get_default_interface().ok();
 
-    let vpn = interfaces
+    // Название туннеля забираем сразу как строку: сам список интерфейсов
+    // дальше уезжает в LinkInfo, и держать в него ссылку неудобно.
+    let vpn_label = interfaces
         .iter()
-        .find(|i| i.is_up() && !i.is_loopback() && is_vpn_like(i));
+        .find(|i| i.is_up() && !i.is_loopback() && is_vpn_like(i))
+        .map(describe);
 
     // Проверка L1: есть ли поднятый физический интерфейс с линком.
-    let usable: Vec<&Interface> = interfaces
+    let usable: Vec<Interface> = interfaces
         .iter()
         .filter(|i| i.is_up() && !i.is_loopback())
+        .cloned()
         .collect();
 
     let l1 = CheckResult::new(
@@ -65,7 +75,7 @@ pub fn run(rep: &Reporter) -> LinkInfo {
     };
     rep.check(l1);
 
-    let Some(iface) = default.or_else(|| usable.first().map(|i| (*i).clone())) else {
+    let Some(iface) = default.or_else(|| usable.first().cloned()) else {
         rep.check(
             CheckResult::new("l2.addr", Layer::L2Link, NodeId::Pc, "IP-адрес").finish(
                 Status::Skipped,
@@ -84,7 +94,9 @@ pub fn run(rep: &Reporter) -> LinkInfo {
             interface: None,
             gateway: None,
             dns_servers: Vec::new(),
-            through_vpn: vpn.is_some(),
+            default_is_tunnel: false,
+            local_v4: Vec::new(),
+            interfaces,
         };
     };
 
@@ -170,13 +182,13 @@ pub fn run(rep: &Reporter) -> LinkInfo {
     rep.check(gw_check);
 
     // Предупреждение про VPN: без него все выводы ниже будут вводить в заблуждение.
-    if let Some(vpn_iface) = vpn {
+    if let Some(label) = &vpn_label {
         rep.check(
             CheckResult::new("l2.vpn", Layer::L2Link, NodeId::Pc, "Активный VPN").finish(
                 Status::Warn,
                 "Похоже, включён VPN. Результаты проверки описывают канал через VPN, \
                  а не ваше настоящее подключение. Для проверки провайдера отключите VPN.",
-                format!("Обнаружен туннельный интерфейс: {}.", describe(vpn_iface)),
+                format!("Обнаружен туннельный интерфейс: {label}."),
             ),
         );
     }
@@ -184,8 +196,10 @@ pub fn run(rep: &Reporter) -> LinkInfo {
     LinkInfo {
         dns_servers: iface.dns_servers.clone(),
         gateway,
-        through_vpn: vpn.is_some(),
+        default_is_tunnel: is_vpn_like(&iface),
+        local_v4: iface.ipv4.iter().map(|n| n.addr()).collect(),
         interface: Some(iface),
+        interfaces,
     }
 }
 

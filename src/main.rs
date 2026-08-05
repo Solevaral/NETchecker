@@ -13,11 +13,20 @@ mod engine;
 mod logo;
 mod model;
 mod privileged;
+mod report;
 mod ui;
 
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // Отчёт в консоль: тот же прогон, что и в окне, но результат можно
+    // скопировать и отправить в поддержку. Заодно это единственный способ
+    // проверить движок на машине без графики.
+    if std::env::args().any(|a| a == "--report") {
+        print_report();
+        return Ok(());
+    }
+
     let icon = logo::render(256);
 
     let options = eframe::NativeOptions {
@@ -38,4 +47,38 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
     )
+}
+
+/// Прогоняет диагностику целиком и печатает отчёт.
+fn print_report() {
+    use bus::EngineEvent;
+    use privileged::Capabilities;
+
+    let caps = Capabilities::detect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    engine::spawn(caps, bus::Reporter::new(tx));
+
+    let mut report = model::Report::new();
+    // Канал закроется сам, когда фоновый поток завершится, — это и есть
+    // признак того, что диагностика доработала.
+    for event in rx {
+        match event {
+            EngineEvent::Check(result) => report.apply(*result),
+            EngineEvent::Node {
+                id,
+                subtitle,
+                address,
+            } => {
+                let node = report.node_mut(id);
+                node.subtitle = subtitle;
+                if address.is_some() {
+                    node.address = address;
+                }
+            }
+            EngineEvent::Finished(diagnosis) => report.diagnosis = *diagnosis,
+            EngineEvent::Started { .. } | EngineEvent::Progress { .. } => {}
+        }
+    }
+
+    print!("{}", report::render(&report, caps));
 }
