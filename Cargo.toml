@@ -1,0 +1,26 @@
+[package]
+name = "netchecker"
+version = "0.1.0"
+edition = "2021"
+description = "Диагностика интернет-соединения по модели OSI с наглядной схемой сети"
+license = "MIT"
+repository = "https://github.com/Solevaral/NETchecker"
+
+[[bin]]
+name = "netchecker"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dependencies]
+directories = "6.0.0"
+eframe = "0.36.0"
+netdev = "0.45.0"
+serde = "1.0.229"
+serde_json = "1.0.151"
+socket2 = { version = "0.6.5", features = ["all"] }
