@@ -21,7 +21,7 @@ pub fn render(report: &Report, caps: Capabilities) -> String {
         "Права администратора: {}",
         if caps.elevated { "есть" } else { "нет" }
     );
-    if let Some(path) = crate::targets::settings_path() {
+    if let Some(path) = crate::settings::path() {
         let _ = writeln!(out, "Список целей и настройки: {}", path.display());
     }
     let _ = writeln!(out);

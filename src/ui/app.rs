@@ -7,9 +7,12 @@ use eframe::egui::{self, Color32, CornerRadius, RichText, ScrollArea, Stroke, St
 use crate::bus::{EngineEvent, EventRx, EventTx, Reporter};
 use crate::engine;
 use crate::model::{Layer, NodeId, Report, Status};
+use crate::monitor::Monitor;
 use crate::privileged::Capabilities;
+use crate::settings::Settings;
 use crate::targets::TargetList;
-use crate::ui::{report_tab, targets_tab, theme, topology};
+use crate::tray::{self, Tray};
+use crate::ui::{monitor_tab, report_tab, settings_tab, targets_tab, theme, topology};
 
 /// Какой из разделов открыт.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -17,7 +20,9 @@ enum Tab {
     Overview,
     Layers,
     Targets,
+    Monitor,
     Report,
+    Settings,
     About,
 }
 
@@ -36,10 +41,19 @@ pub struct App {
     /// Узел схемы, по которому кликнули: фильтрует список проверок.
     focus: Option<NodeId>,
     save_state: report_tab::SaveState,
-    /// Что проверять. Загружается из настроек при старте и правится
-    /// пользователем на вкладке «Цели».
+    settings: Settings,
+    settings_state: settings_tab::State,
+    /// Что проверять. Берётся из настроек и правится на вкладке «Цели».
     targets: TargetList,
     targets_editor: targets_tab::Editor,
+    monitor: Monitor,
+    /// Значок в трее. Может отсутствовать: в части окружений Linux трея нет,
+    /// и это не повод не запускаться.
+    tray: Option<Tray>,
+    /// Окно спрятано в трей, а не закрыто.
+    hidden: bool,
+    /// Пользователь выбрал выход — только тогда закрываемся по-настоящему.
+    quitting: bool,
 }
 
 impl App {
@@ -47,11 +61,40 @@ impl App {
         theme::apply(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         let caps = Capabilities::detect();
-        let targets = TargetList::load();
+        let settings = Settings::load();
+        let targets = settings.target_list();
+        let monitor = Monitor::new(caps, settings.interval());
+
+        let tray = match Tray::new(settings.monitor_on_start, tray::autostart::is_enabled()) {
+            Ok(tray) => Some(tray),
+            // Без трея программа остаётся обычным окном. Сообщать об этом
+            // всплывающей ошибкой не за что: пользователь ничего не сделал
+            // не так, а диагностика от этого не страдает.
+            Err(_) => None,
+        };
+
+        if settings.monitor_on_start {
+            monitor.start();
+        }
+
+        // Свёрнутый запуск нужен автозапуску: программа поднимается вместе
+        // с системой, чтобы уже наблюдать за связью, а не мозолить глаза.
+        let hidden = tray.is_some()
+            && (settings.start_minimized || std::env::args().any(|a| a == "--minimized"));
+        if hidden {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
 
         let mut app = Self {
             targets_editor: targets_tab::Editor::new(&targets),
             targets,
+            settings,
+            settings_state: settings_tab::State::default(),
+            monitor,
+            tray,
+            hidden,
+            quitting: false,
             caps,
             tx,
             rx,
@@ -69,6 +112,73 @@ impl App {
         // затем, чтобы узнать, что со связью.
         app.start();
         app
+    }
+
+    /// Показать окно после сворачивания в трей.
+    fn reveal(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Команды из меню значка в трее.
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        let Some(commands) = self.tray.as_ref().map(|t| t.poll()) else {
+            return;
+        };
+
+        for command in commands {
+            match command {
+                tray::Command::Open => self.reveal(ctx),
+                tray::Command::CheckNow => {
+                    self.reveal(ctx);
+                    self.start();
+                }
+                tray::Command::ToggleMonitor => self.toggle_monitor(),
+                tray::Command::ToggleAutostart => {
+                    let next = !tray::autostart::is_enabled();
+                    if tray::autostart::set(next).is_ok() {
+                        self.settings.autostart = next;
+                        let _ = self.settings.save();
+                    }
+                    // Галочку в меню выставляем по факту, а не по намерению:
+                    // система могла операцию и не пустить.
+                    if let Some(tray) = &self.tray {
+                        tray.set_autostart_checked(tray::autostart::is_enabled());
+                    }
+                }
+                tray::Command::Quit => {
+                    self.quitting = true;
+                    self.monitor.stop();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn toggle_monitor(&mut self) {
+        if self.monitor.is_running() {
+            self.monitor.stop();
+        } else {
+            self.monitor.set_interval(self.settings.interval());
+            self.monitor.start();
+        }
+    }
+
+    /// Закрытие окна прячет программу в трей вместо выхода — так же, как
+    /// это делают мессенджеры. Наблюдение при этом продолжает работать,
+    /// иначе прятать было бы незачем.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.quitting || self.tray.is_none() {
+            self.monitor.stop();
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.hidden = true;
     }
 
     fn start(&mut self) {
@@ -152,7 +262,9 @@ impl App {
                 (Tab::Overview, "Схема и вывод"),
                 (Tab::Layers, "Уровни OSI"),
                 (Tab::Targets, "Цели"),
+                (Tab::Monitor, "Наблюдение"),
                 (Tab::Report, "Отчёт"),
+                (Tab::Settings, "Настройки"),
                 (Tab::About, "О программе"),
             ] {
                 if ui.selectable_label(self.tab == tab, name).clicked() {
@@ -329,10 +441,13 @@ impl App {
             );
             ui.add_space(8.0);
             ui.label(
-                RichText::new(
-                    "Сейчас доступен базовый набор проверок. Дальше появятся разбор блокировок, \
-                     сравнение DNS, трассировка, мониторинг и значок в трее.",
-                )
+                RichText::new(if self.tray.is_some() {
+                    "Закрытие окна прячет программу в значок рядом с часами — наблюдение \
+                     при этом продолжает работать. Выйти совсем можно через меню значка."
+                } else {
+                    "Значок в трее в этой системе недоступен, поэтому закрытие окна \
+                     завершает программу."
+                })
                 .color(theme::TEXT_DIM),
             );
         });
@@ -341,6 +456,26 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.handle_tray(&ctx);
+        self.handle_close(&ctx);
+
+        // Значок в трее — единственное, что видно, когда окно спрятано,
+        // поэтому его состояние обновляется всегда.
+        if self.tray.is_some() {
+            let snapshot = self.monitor.snapshot();
+            let running = self.monitor.is_running();
+            if let Some(tray) = &mut self.tray {
+                tray.update(snapshot.health, running, &snapshot.summary);
+            }
+        }
+
+        // Пока окно спрятано, egui перестаёт получать события ввода, а
+        // наблюдение и меню в трее должны продолжать работать.
+        if self.hidden || self.monitor.is_running() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(400));
+        }
+
         self.drain_events();
         if self.running {
             // Пока идут проверки, перерисовываем окно сами: событий от мыши
@@ -386,9 +521,40 @@ impl eframe::App for App {
                             self.running,
                         );
                         if let targets_tab::Action::Apply(list) = action {
+                            self.settings.set_targets(&list);
+                            let _ = self.settings.save();
                             self.targets = list;
                             self.tab = Tab::Overview;
                             self.start();
+                        }
+                    }
+                    Tab::Monitor => {
+                        let snapshot = self.monitor.snapshot();
+                        let toggle = monitor_tab::show(
+                            ui,
+                            &snapshot,
+                            self.monitor.is_running(),
+                            self.settings.interval(),
+                        );
+                        if toggle {
+                            self.toggle_monitor();
+                        }
+                    }
+                    Tab::Settings => {
+                        let outcome = settings_tab::show(
+                            ui,
+                            &mut self.settings,
+                            &mut self.settings_state,
+                            self.tray.is_some(),
+                        );
+                        if outcome.changed {
+                            self.monitor.set_interval(self.settings.interval());
+                            let _ = self.settings.save();
+                        }
+                        if outcome.autostart_changed {
+                            if let Some(tray) = &self.tray {
+                                tray.set_autostart_checked(tray::autostart::is_enabled());
+                            }
                         }
                     }
                     _ => {
@@ -396,7 +562,9 @@ impl eframe::App for App {
                             Tab::Overview => self.overview(ui),
                             Tab::Layers => self.layers(ui),
                             Tab::About => self.about(ui),
-                            Tab::Report | Tab::Targets => unreachable!("обработаны выше"),
+                            Tab::Report | Tab::Targets | Tab::Monitor | Tab::Settings => {
+                                unreachable!("обработаны выше")
+                            }
                         });
                     }
                 }

@@ -12,9 +12,12 @@ mod bus;
 mod engine;
 mod logo;
 mod model;
+mod monitor;
 mod privileged;
 mod report;
+mod settings;
 mod targets;
+mod tray;
 mod ui;
 
 use eframe::egui;
@@ -58,7 +61,8 @@ fn print_report() {
     let caps = Capabilities::detect();
     let (tx, rx) = std::sync::mpsc::channel();
     // Тот же список целей, что и в окне: он лежит в настройках, а не в коде.
-    engine::spawn(caps, targets::TargetList::load(), bus::Reporter::new(tx));
+    let targets = settings::Settings::load().target_list();
+    engine::spawn(caps, targets, bus::Reporter::new(tx));
 
     let mut report = model::Report::new();
     // Канал закроется сам, когда фоновый поток завершится, — это и есть

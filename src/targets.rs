@@ -6,9 +6,6 @@
 //! и задаются просто построчно: список удобнее всего вставлять целиком.
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
-
-use serde::{Deserialize, Serialize};
 
 /// Что именно проверяем.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +122,7 @@ impl TargetList {
         Self::from_lines(&lines)
     }
 
-    fn from_lines(lines: &[String]) -> (Self, Vec<String>) {
+    pub fn from_lines(lines: &[String]) -> (Self, Vec<String>) {
         let mut items: Vec<Target> = Vec::new();
         let mut rejected = Vec::new();
 
@@ -162,54 +159,6 @@ impl TargetList {
             .join("\n")
     }
 
-    /// Читает сохранённый список. При любой беде возвращает список
-    /// по умолчанию: отсутствие файла — это нормальный первый запуск,
-    /// а испорченный файл не повод не запуститься.
-    pub fn load() -> Self {
-        let Some(path) = settings_path() else {
-            return Self::default();
-        };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::default();
-        };
-        // Windows-редакторы (в том числе «Блокнот» и PowerShell) ставят в
-        // начало файла метку кодировки. Разборщик JSON её не ждёт и падает,
-        // а пользователь видит, что его правки просто пропали.
-        let text = text.trim_start_matches('\u{FEFF}');
-        let Ok(stored) = serde_json::from_str::<Stored>(text) else {
-            return Self::default();
-        };
-        let (list, _) = Self::from_lines(&stored.targets);
-        if list.is_empty() {
-            Self::default()
-        } else {
-            list
-        }
-    }
-
-    pub fn save(&self) -> Result<PathBuf, String> {
-        let path = settings_path().ok_or("не удалось определить папку настроек")?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        let stored = Stored {
-            targets: self.items.iter().map(|t| t.value.clone()).collect(),
-        };
-        let text = serde_json::to_string_pretty(&stored).map_err(|e| e.to_string())?;
-        std::fs::write(&path, text).map_err(|e| e.to_string())?;
-        Ok(path)
-    }
-}
-
-/// Файл настроек. Пока в нём только цели, дальше добавится остальное.
-#[derive(Serialize, Deserialize)]
-struct Stored {
-    targets: Vec<String>,
-}
-
-pub fn settings_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "netchecker")
-        .map(|dirs| dirs.config_dir().join("settings.json"))
 }
 
 /// Приводит строку к виду, пригодному для проверки.
@@ -330,17 +279,6 @@ mod tests {
             .collect();
         let (list, _) = TargetList::parse(&many);
         assert_eq!(list.items().len(), MAX);
-    }
-
-    /// Файл настроек люди правят «Блокнотом», а он оставляет в начале метку
-    /// кодировки. Без её отсечения правки молча пропадают.
-    #[test]
-    fn byte_order_mark_does_not_break_parsing() {
-        let with_bom = "\u{FEFF}{\"targets\":[\"ya.ru\"]}";
-        let stored: Stored =
-            serde_json::from_str(with_bom.trim_start_matches('\u{FEFF}')).unwrap();
-        assert_eq!(stored.targets, vec!["ya.ru"]);
-        assert!(serde_json::from_str::<Stored>(with_bom).is_err());
     }
 
     #[test]

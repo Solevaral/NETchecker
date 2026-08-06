@@ -85,18 +85,11 @@ pub fn show(ui: &mut egui::Ui, editor: &mut Editor, report: &Report, busy: bool)
                         // Нормализованный текст возвращается в поле: человек
                         // должен видеть, что именно программа приняла.
                         editor.text = list.to_text();
-                        match list.save() {
-                            Ok(path) => {
-                                editor.message =
-                                    Some(format!("Сохранено: {}", path.display()));
-                                editor.failed = false;
-                            }
-                            Err(e) => {
-                                editor.message =
-                                    Some(format!("Список принят, но не сохранён: {e}"));
-                                editor.failed = true;
-                            }
-                        }
+                        editor.message = Some(format!("Принято целей: {}", list.items().len()));
+                        editor.failed = false;
+                        // Сохранением занимается окно: цели — часть общих
+                        // настроек, и писать файл из двух мест значило бы
+                        // затирать одним другое.
                         action = Action::Apply(list);
                     }
                 }

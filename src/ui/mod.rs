@@ -2,7 +2,9 @@
 //! то, что прислал движок через шину событий.
 
 pub mod app;
+pub mod monitor_tab;
 pub mod report_tab;
+pub mod settings_tab;
 pub mod targets_tab;
 pub mod theme;
 pub mod topology;
