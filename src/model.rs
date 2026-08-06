@@ -206,6 +206,12 @@ pub struct CheckResult {
     pub expert: String,
     /// Сырые данные: адреса, коды ошибок, тайминги.
     pub evidence: Vec<String>,
+    /// Проверка сообщает об условиях замера, а не о состоянии узла.
+    ///
+    /// Такие проверки не красят узел на схеме. Работающий VPN относится к
+    /// компьютеру, но «Ваш компьютер» из-за него не должен становиться
+    /// жёлтым: это читается как поломка, хотя компьютер полностью исправен.
+    pub informational: bool,
 }
 
 impl CheckResult {
@@ -224,7 +230,14 @@ impl CheckResult {
             simple: String::new(),
             expert: String::new(),
             evidence: Vec::new(),
+            informational: false,
         }
+    }
+
+    /// Помечает проверку как рассказывающую об условиях замера.
+    pub fn informational(mut self) -> Self {
+        self.informational = true;
+        self
     }
 
     pub fn finish(
@@ -313,12 +326,48 @@ impl Report {
         let rolled = self
             .checks
             .iter()
-            .filter(|c| c.node == node)
+            .filter(|c| c.node == node && !c.informational)
             .fold(Status::Pending, |acc, c| acc.worse(c.status));
         self.node_mut(node).status = rolled;
     }
 
     pub fn checks_of(&self, layer: Layer) -> impl Iterator<Item = &CheckResult> {
         self.checks.iter().filter(move |c| c.layer == layer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(id: &str, node: NodeId, status: Status) -> CheckResult {
+        CheckResult::new(id, Layer::L2Link, node, "проверка").finish(status, "", "")
+    }
+
+    #[test]
+    fn node_takes_the_worst_status_of_its_checks() {
+        let mut report = Report::new();
+        report.apply(check("a", NodeId::Pc, Status::Ok));
+        report.apply(check("b", NodeId::Pc, Status::Fail));
+        assert_eq!(report.node_mut(NodeId::Pc).status, Status::Fail);
+    }
+
+    /// Работающий VPN — условие замера, а не поломка компьютера. Если бы он
+    /// красил узел жёлтым, человек искал бы неисправность там, где её нет.
+    #[test]
+    fn informational_checks_do_not_paint_the_node() {
+        let mut report = Report::new();
+        report.apply(check("ok", NodeId::Pc, Status::Ok));
+        report.apply(check("vpn", NodeId::Pc, Status::Warn).informational());
+        assert_eq!(report.node_mut(NodeId::Pc).status, Status::Ok);
+    }
+
+    #[test]
+    fn repeated_check_replaces_the_previous_one() {
+        let mut report = Report::new();
+        report.apply(check("a", NodeId::Pc, Status::Running));
+        report.apply(check("a", NodeId::Pc, Status::Ok));
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.node_mut(NodeId::Pc).status, Status::Ok);
     }
 }

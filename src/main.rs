@@ -62,7 +62,8 @@ fn print_report() {
     let (tx, rx) = std::sync::mpsc::channel();
     // Тот же список целей, что и в окне: он лежит в настройках, а не в коде.
     let targets = settings::Settings::load().target_list();
-    engine::spawn(caps, targets, bus::Reporter::new(tx));
+    // В консольном режиме останавливать некому: прогон идёт до конца.
+    engine::spawn(caps, targets, bus::Reporter::new(tx, bus::Cancel::new()));
 
     let mut report = model::Report::new();
     // Канал закроется сам, когда фоновый поток завершится, — это и есть
@@ -82,7 +83,9 @@ fn print_report() {
                 }
             }
             EngineEvent::Finished(diagnosis) => report.diagnosis = *diagnosis,
-            EngineEvent::Started { .. } | EngineEvent::Progress { .. } => {}
+            EngineEvent::Started { .. }
+            | EngineEvent::Progress { .. }
+            | EngineEvent::Cancelled => {}
         }
     }
 

@@ -29,7 +29,7 @@ use crate::privileged::Capabilities;
 use crate::targets::{Kind, Target, TargetList};
 
 use icmp::{Pinger, ReplyKind};
-use probe::{ms, tcp_connect, TcpOutcome};
+use probe::{tcp_connect, TcpOutcome};
 
 /// Опорные точки интернета. Разные операторы и разные страны — если недоступны
 /// сразу все, дело почти наверняка не в них.
@@ -71,8 +71,9 @@ const PARALLEL_TARGETS: usize = 6;
 /// и потери, и разброс задержки.
 const PING_COUNT: usize = 4;
 
-/// Всего шагов в конвейере — должно совпадать с числом вызовов `progress`.
-const STEPS: usize = 7;
+/// Шагов до проверки целей. Дальше каждая цель — свой шаг: их бывает
+/// два десятка, и застывший на месте прогресс выглядел бы зависанием.
+const STEPS: usize = 6;
 
 /// Запускает диагностику в фоне. Вызывающий продолжает рисовать окно.
 pub fn spawn(caps: Capabilities, targets: TargetList, rep: Reporter) {
@@ -80,13 +81,29 @@ pub fn spawn(caps: Capabilities, targets: TargetList, rep: Reporter) {
 }
 
 fn run(caps: Capabilities, targets: &TargetList, rep: &Reporter) {
-    rep.send(EngineEvent::Started { total: STEPS });
+    rep.send(EngineEvent::Started {
+        total: STEPS + targets.items().len(),
+    });
+
+    // Между шагами смотрим, не попросили ли остановиться. Обрывать сетевую
+    // пробу на середине незачем: она всё равно закончится по тайм-ауту,
+    // а вот запускать следующую уже не нужно.
+    macro_rules! stop_if_cancelled {
+        () => {
+            if rep.cancelled() {
+                rep.send(EngineEvent::Cancelled);
+                return;
+            }
+        };
+    }
 
     rep.progress(0, "Проверяю сетевой адаптер и роутер…");
     let link = l1_l2::run(rep);
+    stop_if_cancelled!();
 
     rep.progress(1, "Ищу VPN, прокси и средства обхода…");
     let bypass = check_bypass(rep, &link);
+    stop_if_cancelled!();
 
     let pinger = Pinger::new(caps);
     if pinger.is_none() {
@@ -102,17 +119,21 @@ fn run(caps: Capabilities, targets: &TargetList, rep: &Reporter) {
 
     rep.progress(2, "Проверяю отклик роутера…");
     let router_alive = check_router(rep, pinger.as_ref(), link.gateway);
+    stop_if_cancelled!();
 
     rep.progress(3, "Проверяю выход в интернет…");
     let reachable_anchor = check_anchors(rep, pinger.as_ref(), caps);
+    stop_if_cancelled!();
 
     rep.progress(4, "Строю маршрут до интернета…");
     let route = check_route(rep, pinger.as_ref(), &link, reachable_anchor);
+    stop_if_cancelled!();
 
-    rep.progress(5, "Проверяю имена сайтов и соединение с ними…");
+    rep.progress(5, "Проверяю имена сайтов…");
     let dns_ok = check_dns_and_sites(rep, &link, targets);
+    stop_if_cancelled!();
 
-    rep.progress(6, "Проверяю блокировки…");
+    rep.progress(STEPS, "Проверяю блокировки…");
     let transit = if dns_ok && reachable_anchor.is_some() {
         check_censorship(rep, &link, &bypass, targets)
     } else {
@@ -129,7 +150,8 @@ fn run(caps: Capabilities, targets: &TargetList, rep: &Reporter) {
         censorship::Transit::default()
     };
 
-    rep.progress(STEPS, "Готово");
+    stop_if_cancelled!();
+    rep.progress(STEPS + targets.items().len(), "Готово");
     rep.send(EngineEvent::Finished(Box::new(verdict(Observations {
         link: &link,
         bypass: &bypass,
@@ -191,7 +213,9 @@ fn check_bypass(rep: &Reporter, link: &l1_l2::LinkInfo) -> bypass::Report {
             f.evidence
         ))
     });
-    rep.check(check);
+    // Найденный обход относится к компьютеру, но не является его поломкой:
+    // узел «Ваш компьютер» из-за него желтеть не должен.
+    rep.check(check.informational());
 
     report
 }
@@ -550,39 +574,9 @@ fn check_dns_and_sites(rep: &Reporter, link: &l1_l2::LinkInfo, targets: &TargetL
     };
     rep.check(evidence.into_iter().fold(dns, |c, e| c.with_evidence(e)));
 
-    // Соединение с конкретным сайтом — отдельная проверка: DNS может работать,
-    // а соединение при этом обрываться.
-    let site = domains[0];
-    let conn = CheckResult::new(
-        "l7.site",
-        Layer::L7Application,
-        NodeId::Target,
-        format!("Соединение с {site}"),
-    );
-    let conn = match (site, 443u16).to_socket_addrs().map(|mut a| a.next()) {
-        Ok(Some(addr)) => {
-            rep.node(NodeId::Target, site, Some(addr.ip().to_string()));
-            let outcome = tcp_connect(addr, TIMEOUT);
-            match &outcome {
-                TcpOutcome::Open { rtt } => conn.finish(
-                    Status::Ok,
-                    format!("Сайт {site} открывается, ответ за {} мс.", ms(*rtt)),
-                    format!("TCP {addr} установлено за {} мс.", ms(*rtt)),
-                ),
-                _ => conn.finish(
-                    Status::Fail,
-                    format!("До сайта {site} не удаётся достучаться."),
-                    format!("TCP {addr}: {}", outcome.describe()),
-                ),
-            }
-        }
-        _ => conn.finish(
-            Status::Skipped,
-            "Проверка пропущена: адрес сайта не удалось узнать.",
-            "Имя не разрешилось, соединение проверять не по чему.",
-        ),
-    };
-    rep.check(conn);
+    // Отдельной проверки соединения с одним сайтом здесь нет намеренно:
+    // каждая цель из списка и так проверяется ниже, целиком и подробнее.
+    // Дубль только сбивал бы с толку — две строки об одном и том же.
 
     resolved_any
 }
@@ -611,8 +605,11 @@ fn check_censorship(
     // десятков сайтов занимал бы минуты: каждая недоступная цель — это
     // несколько тайм-аутов подряд, и человек всё это время смотрит в пустоту.
     for chunk in items.chunks(PARALLEL_TARGETS) {
+        if rep.cancelled() {
+            break;
+        }
         rep.progress(
-            6,
+            STEPS + done,
             format!(
                 "Проверяю блокировки: {} ({}/{total})",
                 chunk.iter().map(|t| t.value.as_str()).collect::<Vec<_>>().join(", "),
@@ -660,6 +657,20 @@ fn check_censorship(
             findings.push(finding);
         }
     }
+
+    // Узел «Сайт» на схеме — про весь список, а не про случайно первую цель:
+    // при двух десятках целей показывать одну из них значило бы врать
+    // о состоянии остальных.
+    let reachable = findings
+        .iter()
+        .filter(|f| f.verdict == censorship::Verdict::Reachable)
+        .count();
+    let checked = findings.len();
+    rep.node(
+        NodeId::Target,
+        format!("открываются {reachable} из {checked}"),
+        None,
+    );
 
     let transit = censorship::transit_signals(&probes, &findings);
 
@@ -942,6 +953,57 @@ fn ping_stats(pinger: &Pinger, target: Ipv4Addr) -> PingStats {
     }
 
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::Cancel;
+
+    /// Просьба остановиться обязана прерывать конвейер, а не игнорироваться
+    /// до конца прогона: полная проверка идёт десятки секунд.
+    #[test]
+    fn cancellation_stops_the_pipeline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Cancel::new();
+        cancel.request();
+
+        let caps = Capabilities::detect();
+        run(caps, &TargetList::default(), &Reporter::new(tx, cancel));
+
+        let events: Vec<EngineEvent> = rx.iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Cancelled)),
+            "не пришло сообщение об остановке"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Finished(_))),
+            "прерванная проверка не должна выдавать вердикт"
+        );
+    }
+
+    /// Число шагов, обещанное в начале, должно сходиться с числом целей:
+    /// иначе полоса прогресса врёт.
+    #[test]
+    fn promised_steps_account_for_every_target() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Cancel::new();
+        cancel.request();
+
+        let targets = TargetList::default();
+        let expected = STEPS + targets.items().len();
+        run(Capabilities::detect(), &targets, &Reporter::new(tx, cancel));
+
+        let total = rx.iter().find_map(|e| match e {
+            EngineEvent::Started { total } => Some(total),
+            _ => None,
+        });
+        assert_eq!(total, Some(expected));
+    }
 }
 
 /// Всё, что удалось выяснить, — вход для правил вывода.

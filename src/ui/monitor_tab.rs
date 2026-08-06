@@ -162,13 +162,13 @@ fn journal(ui: &mut egui::Ui, snapshot: &Snapshot) {
             // Свежие сверху: спрашивают всегда про последний обрыв.
             for outage in snapshot.outages.iter().rev() {
                 let duration = match outage.duration() {
-                    Some(d) => format!("{} с", d.as_secs().max(1)),
+                    Some(d) => format!("длился {}", human_duration(d)),
                     None => "продолжается".to_string(),
                 };
                 ui.label(
                     RichText::new(format!(
                         "{} — {duration} · {}",
-                        local_time(outage.started),
+                        ago(outage.started),
                         outage.reason
                     ))
                     .color(theme::FAIL),
@@ -177,17 +177,29 @@ fn journal(ui: &mut egui::Ui, snapshot: &Snapshot) {
         });
 }
 
-/// Время в виде «часы:минуты:секунды».
+/// «Сколько времени назад это случилось».
 ///
-/// Полноценной работы с датами ради одной строки в журнале не заводим:
-/// обрывы смотрят в тот же день, когда они случились.
-fn local_time(at: SystemTime) -> String {
-    let secs = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let day = secs % 86_400;
-    format!("{:02}:{:02}:{:02} UTC", day / 3600, (day % 3600) / 60, day % 60)
+/// Часовой пояс без сторонней библиотеки не определить, а показывать журнал
+/// обрывов по UTC — значит заставлять человека пересчитывать время в уме.
+/// К тому же на вопрос «когда пропадало» относительное время отвечает прямее:
+/// важно, было это пять минут назад или три часа назад, а не точный час.
+fn ago(at: SystemTime) -> String {
+    match SystemTime::now().duration_since(at) {
+        Ok(elapsed) if elapsed.as_secs() < 10 => "только что".to_string(),
+        Ok(elapsed) => format!("{} назад", human_duration(elapsed)),
+        // Часы могли перевести назад — не повод показывать бессмыслицу.
+        Err(_) => "только что".to_string(),
+    }
+}
+
+/// Длительность словами: секунды, минуты или часы, но не всё сразу.
+fn human_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{} с", secs.max(1)),
+        60..=3599 => format!("{} мин", secs / 60),
+        _ => format!("{} ч {} мин", secs / 3600, (secs % 3600) / 60),
+    }
 }
 
 #[cfg(test)]
@@ -196,9 +208,25 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn time_is_formatted_as_clock() {
-        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(3661);
-        assert_eq!(local_time(at), "01:01:01 UTC");
+    fn durations_are_written_in_words() {
+        assert_eq!(human_duration(Duration::from_millis(300)), "1 с");
+        assert_eq!(human_duration(Duration::from_secs(45)), "45 с");
+        assert_eq!(human_duration(Duration::from_secs(600)), "10 мин");
+        assert_eq!(human_duration(Duration::from_secs(7_320)), "2 ч 2 мин");
+    }
+
+    #[test]
+    fn recent_events_are_called_just_now() {
+        assert_eq!(ago(SystemTime::now()), "только что");
+        let long_ago = SystemTime::now() - Duration::from_secs(600);
+        assert_eq!(ago(long_ago), "10 мин назад");
+    }
+
+    /// Перевод часов назад не должен превращать журнал в бессмыслицу.
+    #[test]
+    fn future_timestamps_do_not_break_the_journal() {
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        assert_eq!(ago(future), "только что");
     }
 
     #[test]

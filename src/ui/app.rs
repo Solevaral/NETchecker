@@ -4,9 +4,9 @@ use std::sync::mpsc::{self, TryRecvError};
 
 use eframe::egui::{self, Color32, CornerRadius, RichText, ScrollArea, Stroke, StrokeKind};
 
-use crate::bus::{EngineEvent, EventRx, EventTx, Reporter};
+use crate::bus::{Cancel, EngineEvent, EventRx, EventTx, Reporter};
 use crate::engine;
-use crate::model::{Layer, NodeId, Report, Status};
+use crate::model::{Diagnosis, Layer, NodeId, Report, Status};
 use crate::monitor::Monitor;
 use crate::privileged::Capabilities;
 use crate::settings::Settings;
@@ -54,6 +54,8 @@ pub struct App {
     hidden: bool,
     /// Пользователь выбрал выход — только тогда закрываемся по-настоящему.
     quitting: bool,
+    /// Признак остановки для идущей проверки.
+    cancel: Cancel,
 }
 
 impl App {
@@ -95,6 +97,7 @@ impl App {
             tray,
             hidden,
             quitting: false,
+            cancel: Cancel::new(),
             caps,
             tx,
             rx,
@@ -191,10 +194,13 @@ impl App {
         self.total = 0;
         self.progress_label = "Запускаю проверку…".to_string();
         self.focus = None;
+        // Новый признак остановки на каждый запуск: старый мог остаться
+        // взведённым от прерванной проверки.
+        self.cancel = Cancel::new();
         engine::spawn(
             self.caps,
             self.targets.clone(),
-            Reporter::new(self.tx.clone()),
+            Reporter::new(self.tx.clone(), self.cancel.clone()),
         );
     }
 
@@ -223,6 +229,21 @@ impl App {
                     self.report.diagnosis = *diagnosis;
                     self.running = false;
                 }
+                Ok(EngineEvent::Cancelled) => {
+                    self.running = false;
+                    // Показываем ровно то, что успели узнать, и честно
+                    // говорим, что картина неполная.
+                    self.report.diagnosis = Diagnosis {
+                        headline: "Проверка остановлена".into(),
+                        simple: "Успевшие пройти проверки показаны ниже, остальные не \
+                                 выполнялись — картина неполная."
+                            .into(),
+                        expert: String::new(),
+                        actions: vec!["Нажмите «Проверить», чтобы пройти всё заново.".into()],
+                        break_edge: None,
+                        status: Status::Skipped,
+                    };
+                }
                 Err(TryRecvError::Empty) => break,
                 // Отправитель исчез вместе с фоновым потоком — это норма
                 // между запусками, канал живёт вместе с приложением.
@@ -242,15 +263,15 @@ impl App {
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if self.running {
-                    "Идёт проверка…"
-                } else {
-                    "Проверить"
-                };
-                if ui
-                    .add_enabled(!self.running, egui::Button::new(label))
-                    .clicked()
-                {
+                // Полная проверка идёт десятки секунд, и всё это время
+                // человек не должен оставаться заложником запущенного
+                // конвейера — поэтому кнопка меняется на «Остановить».
+                if self.running {
+                    if ui.button("Остановить").clicked() {
+                        self.cancel.request();
+                        self.progress_label = "Останавливаю…".to_string();
+                    }
+                } else if ui.button("Проверить").clicked() {
                     self.start();
                 }
                 ui.checkbox(&mut self.expert, "Экспертный режим");

@@ -4,15 +4,19 @@
 //! а окно разбирает их в начале каждого кадра. Благодаря этому интерфейс
 //! остаётся отзывчивым, пока проверки висят на сетевых таймаутах.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 
 use crate::model::{CheckResult, Diagnosis, NodeId};
 
 /// Событие от движка к интерфейсу.
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    /// Диагностика началась; `total` — сколько проверок запланировано.
+    /// Диагностика началась; `total` — сколько шагов запланировано.
     Started { total: usize },
+    /// Проверка прервана по просьбе пользователя.
+    Cancelled,
     /// Проверка запущена или завершена (UI обновляет строку по `result.id`).
     Check(Box<CheckResult>),
     /// Уточнение подписи и адреса узла схемы.
@@ -34,14 +38,45 @@ pub type EventRx = Receiver<EngineEvent>;
 ///
 /// Если пользователь закрыл окно посреди проверки, фоновому потоку незачем
 /// падать с паникой — он просто доработает и завершится.
+/// Признак «пользователь попросил прекратить».
+///
+/// Полная проверка занимает десятки секунд, и всё это время человек не должен
+/// оставаться заложником запущенного конвейера. Проверки смотрят на этот флаг
+/// между шагами: обрывать сетевую пробу на середине незачем, она всё равно
+/// закончится через свой тайм-аут.
+#[derive(Clone, Default)]
+pub struct Cancel {
+    flag: Arc<AtomicBool>,
+}
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn request(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    pub fn requested(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub struct Reporter {
     tx: EventTx,
+    cancel: Cancel,
 }
 
 impl Reporter {
-    pub fn new(tx: EventTx) -> Self {
-        Self { tx }
+    pub fn new(tx: EventTx, cancel: Cancel) -> Self {
+        Self { tx, cancel }
+    }
+
+    /// Просили ли прекратить проверку.
+    pub fn cancelled(&self) -> bool {
+        self.cancel.requested()
     }
 
     pub fn send(&self, event: EngineEvent) {
