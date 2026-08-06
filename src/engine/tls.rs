@@ -103,23 +103,45 @@ pub fn probe(
     delivery: Delivery,
     timeout: Duration,
 ) -> Outcome {
+    probe_with(address, port, sni, delivery, timeout, true).0
+}
+
+/// То же, но с возвратом сырого ответа и выбором версии.
+///
+/// Версия важна: в TLS 1.3 сертификат сервера зашифрован и прочитать его,
+/// не выполняя обмен ключами, невозможно. Поэтому проверка сертификата ходит
+/// отдельной пробой, где TLS 1.3 не предлагается вовсе.
+pub fn probe_with(
+    address: Ipv4Addr,
+    port: u16,
+    sni: &str,
+    delivery: Delivery,
+    timeout: Duration,
+    allow_tls13: bool,
+) -> (Outcome, Vec<u8>) {
     let addr = SocketAddr::new(address.into(), port);
     let mut stream = match TcpStream::connect_timeout(&addr, timeout) {
         Ok(s) => s,
         Err(e) => {
-            return Outcome::ConnectFailed {
-                error: e.to_string(),
-            }
+            return (
+                Outcome::ConnectFailed {
+                    error: e.to_string(),
+                },
+                Vec::new(),
+            )
         }
     };
 
     if stream.set_read_timeout(Some(timeout)).is_err() || stream.set_nodelay(true).is_err() {
-        return Outcome::ConnectFailed {
-            error: "не удалось настроить сокет".into(),
-        };
+        return (
+            Outcome::ConnectFailed {
+                error: "не удалось настроить сокет".into(),
+            },
+            Vec::new(),
+        );
     }
 
-    let hello = client_hello(sni);
+    let hello = client_hello_versioned(sni, allow_tls13);
     let started = Instant::now();
 
     let sent = match delivery {
@@ -138,17 +160,83 @@ pub fn probe(
     };
 
     if let Err(e) = sent.and_then(|_| stream.flush()) {
-        return classify_error(&e, started.elapsed());
+        return (classify_error(&e, started.elapsed()), Vec::new());
     }
 
-    let mut buf = [0u8; 1024];
-    match stream.read(&mut buf) {
-        Ok(0) => Outcome::Closed {
-            after: started.elapsed(),
-        },
-        Ok(n) => classify_response(&buf[..n], started.elapsed()),
-        Err(e) => classify_error(&e, started.elapsed()),
+    // Читаем не один пакет, а всё, что сервер успел прислать: сертификат
+    // не помещается в первую запись и приходит следом.
+    let mut received = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                received.extend_from_slice(&buf[..n]);
+                // Дальше сервер ждёт нашего ответа, которого не будет.
+                // Ограничение по объёму — на случай болтливого собеседника.
+                if received.len() > 32 * 1024 || !allow_tls13 && has_certificate(&received) {
+                    break;
+                }
+                if allow_tls13 {
+                    break;
+                }
+            }
+            Err(e) => {
+                if received.is_empty() {
+                    return (classify_error(&e, started.elapsed()), Vec::new());
+                }
+                break;
+            }
+        }
     }
+
+    let elapsed = started.elapsed();
+    if received.is_empty() {
+        return (Outcome::Closed { after: elapsed }, received);
+    }
+    (classify_response(&received, elapsed), received)
+}
+
+/// Дошло ли до сообщения с сертификатом — дальше читать нечего.
+fn has_certificate(bytes: &[u8]) -> bool {
+    handshake_messages(bytes).iter().any(|(kind, _)| *kind == 11)
+}
+
+/// Собирает сообщения рукопожатия из потока записей TLS.
+///
+/// Одно сообщение может быть разрезано между записями, а в одной записи их
+/// может лежать несколько, поэтому содержимое сначала склеивается.
+pub fn handshake_messages(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut payload = Vec::new();
+    let mut pos = 0;
+    while pos + 5 <= bytes.len() {
+        let kind = bytes[pos];
+        let len = u16::from_be_bytes([bytes[pos + 3], bytes[pos + 4]]) as usize;
+        let end = pos + 5 + len;
+        if end > bytes.len() {
+            break;
+        }
+        if kind == 0x16 {
+            payload.extend_from_slice(&bytes[pos + 5..end]);
+        }
+        pos = end;
+    }
+
+    let mut messages = Vec::new();
+    let mut i = 0;
+    while i + 4 <= payload.len() {
+        let kind = payload[i];
+        let len = ((payload[i + 1] as usize) << 16)
+            | ((payload[i + 2] as usize) << 8)
+            | payload[i + 3] as usize;
+        let end = i + 4 + len;
+        if end > payload.len() {
+            break;
+        }
+        messages.push((kind, payload[i + 4..end].to_vec()));
+        i = end;
+    }
+    messages
 }
 
 fn classify_error(error: &std::io::Error, after: Duration) -> Outcome {
@@ -176,7 +264,10 @@ fn classify_response(bytes: &[u8], rtt: Duration) -> Outcome {
 }
 
 /// Собирает ClientHello с указанным именем сайта.
-fn client_hello(sni: &str) -> Vec<u8> {
+///
+/// `allow_tls13` выключается ради проверки сертификата: в TLS 1.3 он
+/// зашифрован, и прочитать его, не выполняя обмен ключами, невозможно.
+fn client_hello_versioned(sni: &str, allow_tls13: bool) -> Vec<u8> {
     let mut body = Vec::with_capacity(256);
 
     body.extend_from_slice(&[0x03, 0x03]); // версия TLS 1.2
@@ -203,9 +294,11 @@ fn client_hello(sni: &str) -> Vec<u8> {
         0x000D,
         &[0x00, 0x08, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x02, 0x01],
     )); // алгоритмы подписи
-    extensions.extend_from_slice(&extension(0x002B, &[0x04, 0x03, 0x04, 0x03, 0x03])); // версии
-    extensions.extend_from_slice(&extension(0x002D, &[0x01, 0x01])); // режимы обмена ключами
-    extensions.extend_from_slice(&extension_key_share());
+    if allow_tls13 {
+        extensions.extend_from_slice(&extension(0x002B, &[0x04, 0x03, 0x04, 0x03, 0x03])); // версии
+        extensions.extend_from_slice(&extension(0x002D, &[0x01, 0x01])); // режимы обмена ключами
+        extensions.extend_from_slice(&extension_key_share());
+    }
 
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
@@ -282,6 +375,11 @@ fn client_random() -> [u8; 32] {
 mod tests {
     use super::*;
 
+    /// Обычная проба идёт с предложением TLS 1.3.
+    fn client_hello(sni: &str) -> Vec<u8> {
+        client_hello_versioned(sni, true)
+    }
+
     /// Проба обязана содержать заготовку ключа: без неё сервер, согласившийся
     /// на TLS 1.3, отвечает отказом «отсутствует расширение», и любой сайт
     /// выглядел бы сломанным.
@@ -323,6 +421,43 @@ mod tests {
         let a = client_hello("a.example");
         let b = client_hello("bb.example");
         assert_ne!(a, b);
+    }
+
+    /// В режиме для проверки сертификата TLS 1.3 не предлагается вовсе:
+    /// иначе сервер выберет его и зашифрует сертификат.
+    #[test]
+    fn certificate_mode_hello_offers_no_tls13() {
+        let hello = client_hello_versioned("example.com", false);
+        for extension in [[0x00u8, 0x2B], [0x00, 0x33]] {
+            assert!(
+                !hello.windows(2).any(|w| w == extension),
+                "в пробе для сертификата остались расширения TLS 1.3"
+            );
+        }
+    }
+
+    /// Записи рукопожатия склеиваются: одно сообщение может быть разрезано
+    /// между ними, а сертификат в одну запись обычно не помещается.
+    #[test]
+    fn handshake_messages_are_reassembled_across_records() {
+        // Сообщение типа 11 длиной 6 байт, разложенное на две записи.
+        let message = [11u8, 0, 0, 6, 1, 2, 3, 4, 5, 6];
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&[0x16, 0x03, 0x03, 0x00, 0x05]);
+        stream.extend_from_slice(&message[..5]);
+        stream.extend_from_slice(&[0x16, 0x03, 0x03, 0x00, 0x05]);
+        stream.extend_from_slice(&message[5..]);
+
+        let messages = handshake_messages(&stream);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, 11);
+        assert_eq!(messages[0].1, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn truncated_records_do_not_panic() {
+        assert!(handshake_messages(&[0x16, 0x03]).is_empty());
+        assert!(handshake_messages(&[0x16, 0x03, 0x03, 0xFF, 0xFF, 0x01]).is_empty());
     }
 
     #[test]

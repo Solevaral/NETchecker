@@ -27,6 +27,10 @@ pub enum Verdict {
     NameFiltered,
     /// Не пускает сам адрес: до него не доходят пакеты.
     AddressBlocked,
+    /// Вместо сайта отдают страницу с сообщением о блокировке.
+    StubPage,
+    /// Соединение вскрывают: предъявлен чужой сертификат.
+    CertificateSwapped,
     /// Похоже, сайт действительно недоступен — фильтрация ни при чём.
     SiteDown,
     /// Данных не хватило.
@@ -40,6 +44,8 @@ impl Verdict {
             Verdict::DnsSpoofed => "подменён адрес",
             Verdict::NameFiltered => "блокировка по имени сайта",
             Verdict::AddressBlocked => "блокировка по адресу",
+            Verdict::StubPage => "подставлена страница-заглушка",
+            Verdict::CertificateSwapped => "подменён сертификат",
             Verdict::SiteDown => "сайт не отвечает",
             Verdict::Unclear => "не удалось определить",
         }
@@ -65,6 +71,11 @@ pub struct Probe {
     pub neutral_sni: Option<Outcome>,
     /// Настоящее имя, но пакет отправлен двумя частями.
     pub split_sni: Option<Outcome>,
+    /// Сертификат, который предъявил сервер.
+    pub certificate: Option<crate::engine::cert::Info>,
+    /// Ответ по незащищённому HTTP и вывод о том, заглушка это или нет.
+    pub http: Option<crate::engine::http::Response>,
+    pub http_stub: Option<String>,
 }
 
 impl Probe {
@@ -78,6 +89,9 @@ impl Probe {
             real_sni: None,
             neutral_sni: None,
             split_sni: None,
+            certificate: None,
+            http: None,
+            http_stub: None,
         }
     }
 }
@@ -116,6 +130,12 @@ pub fn judge(p: &Probe) -> Finding {
             "время установки соединения с сервером: {} мс",
             b.as_millis()
         ));
+    }
+    if let Some(cert) = &p.certificate {
+        evidence.push(format!("сертификат: {}", cert.describe()));
+    }
+    if let Some(response) = &p.http {
+        evidence.push(format!("ответ по HTTP: {}", response.describe()));
     }
 
     let make = |verdict: Verdict, simple: String, expert: String| Finding {
@@ -162,6 +182,44 @@ pub fn judge(p: &Probe) -> Finding {
         }
     }
 
+    // 2. Подмена сертификата. Проверяется раньше проб по имени: если
+    //    соединение вскрывают, оно как раз *устанавливается*, и по одним
+    //    только пробам сайт выглядел бы работающим.
+    if let Some(cert) = &p.certificate {
+        if !cert.covers(&p.domain) {
+            let reason = if cert.self_signed() {
+                "Сертификат выписан сам себе"
+            } else {
+                "Сертификат выдан на другое имя"
+            };
+            return make(
+                Verdict::CertificateSwapped,
+                format!(
+                    "Соединение с {} кто-то вскрывает: сервер предъявляет не тот сертификат. \
+                     Всё, что вы отправите на этот сайт, видно посреднику.",
+                    p.domain
+                ),
+                format!("{reason}: {}.", cert.describe()),
+            );
+        }
+    }
+
+    // 3. Страница-заглушка вместо сайта.
+    if let Some(reason) = &p.http_stub {
+        return make(
+            Verdict::StubPage,
+            format!(
+                "Вместо сайта {} отдают страницу с сообщением о блокировке. Сайт при этом \
+                 может быть полностью исправен — ответ подставили по дороге.",
+                p.domain
+            ),
+            format!(
+                "Запрос по HTTP с именем {} вернул заглушку: {reason}.",
+                p.domain
+            ),
+        );
+    }
+
     let (Some(real), Some(neutral)) = (&p.real_sni, &p.neutral_sni) else {
         return make(
             Verdict::Unclear,
@@ -170,7 +228,7 @@ pub fn judge(p: &Probe) -> Finding {
         );
     };
 
-    // 2. Фильтрация по имени. Тот же адрес, тот же порт, отличается только имя
+    // 4. Фильтрация по имени. Тот же адрес, тот же порт, отличается только имя
     //    в первом пакете — если разница есть, дело именно в имени.
     if real.is_broken() && neutral.is_answered() {
         let split_helped = p.split_sni.as_ref().is_some_and(Outcome::is_answered);

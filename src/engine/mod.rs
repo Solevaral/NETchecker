@@ -12,10 +12,13 @@
 
 pub mod bypass;
 pub mod censorship;
+pub mod cert;
 pub mod dns;
+pub mod http;
 pub mod icmp;
 pub mod l1_l2;
 pub mod probe;
+pub mod speed;
 pub mod tls;
 pub mod trace;
 
@@ -672,6 +675,8 @@ fn check_censorship(
         None,
     );
 
+    check_speed(rep, &agent);
+
     let transit = censorship::transit_signals(&probes, &findings);
 
     let check = CheckResult::new(
@@ -818,7 +823,105 @@ fn probe_target(
         ));
     }
 
+    if !target.is_domain() {
+        return probe;
+    }
+
+    // Сертификат достаётся отдельной пробой без TLS 1.3: в нём сертификат
+    // зашифрован, и прочитать его, не выполняя обмен ключами, нельзя.
+    if !broken {
+        let (_, raw) = tls::probe_with(
+            address,
+            443,
+            domain,
+            tls::Delivery::Whole,
+            PROBE_TIMEOUT,
+            false,
+        );
+        probe.certificate = cert::from_handshake(&tls::handshake_messages(&raw));
+    }
+
+    // Незащищённый HTTP: именно туда подставляют страницу-заглушку, потому
+    // что там имя сайта видно посреднику открытым текстом.
+    if let Ok(response) = http::get(address, domain, PROBE_TIMEOUT) {
+        probe.http_stub = http::looks_like_stub(&response, domain);
+        probe.http = Some(response);
+    }
+
     probe
+}
+
+/// Замер скорости и поиск избирательного замедления.
+fn check_speed(rep: &Reporter, agent: &ureq::Agent) {
+    let check = CheckResult::new(
+        "l7.speed",
+        Layer::L7Application,
+        NodeId::Provider,
+        "Скорость и замедление",
+    );
+
+    let (measurements, verdict) = speed::run(agent);
+
+    let check = match verdict {
+        speed::Verdict::Unavailable => check.finish(
+            Status::Skipped,
+            "Скорость измерить не удалось: сервисы замера не ответили.",
+            "Ни один из замеров не завершился.",
+        ),
+        speed::Verdict::Even { best } => check.finish(
+            Status::Ok,
+            format!(
+                "Скорость ровная, до {best:.0} Мбит/с. Признаков того, что кто-то избирательно \
+                 режет скорость, нет."
+            ),
+            "Разброс между точками замера в пределах обычной разницы между сетями.",
+        ),
+        speed::Verdict::Inconclusive {
+            best,
+            slow,
+            slow_mbps,
+            latency_ratio,
+        } => check.finish(
+            Status::Ok,
+            format!(
+                "Скорость до ближайшей точки замера — {best:.0} Мбит/с. До «{slow}» всего \
+                 {slow_mbps:.1} Мбит/с, но и расположена она примерно в {latency_ratio:.0} раза \
+                 дальше, а на большом расстоянии скорость честно падает. Сказать по этим \
+                 данным, режет ли кто-то скорость, нельзя."
+            ),
+            format!(
+                "Разброс скоростей велик, но задержки различаются в {latency_ratio:.1} раза — \
+                 разница объясняется расстоянием. Пропускная способность TCP обратно \
+                 пропорциональна времени оборота."
+            ),
+        ),
+        speed::Verdict::Uneven { fast, slow, ratio } => check.finish(
+            Status::Warn,
+            format!(
+                "До «{slow}» скорость примерно в {ratio:.0} раз ниже, чем до «{fast}». Свой \
+                 канал просел бы одинаково ко всем, поэтому дело, скорее всего, не в нём."
+            ),
+            format!(
+                "Односторонняя просадка в {ratio:.1} раза при сопоставимой задержке — картина \
+                 избирательного ограничения, а не загруженного канала."
+            ),
+        ),
+        speed::Verdict::SlowBody { name, mbps } => check.finish(
+            Status::Warn,
+            format!(
+                "До «{name}» соединение устанавливается быстро, а данные идут всего \
+                 {mbps:.1} Мбит/с. Так выглядит ограничение скорости: при обычной перегрузке \
+                 вместе со скоростью растёт и время отклика."
+            ),
+            format!("Быстрый отклик при скорости {mbps:.2} Мбит/с."),
+        ),
+    };
+
+    rep.check(
+        measurements
+            .iter()
+            .fold(check, |c, m| c.with_evidence(m.describe())),
+    );
 }
 
 /// Перехватывает ли провайдер обращения к чужим DNS-серверам.
