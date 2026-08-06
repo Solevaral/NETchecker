@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod report_tab;
+pub mod targets_tab;
 pub mod theme;
 pub mod topology;
 

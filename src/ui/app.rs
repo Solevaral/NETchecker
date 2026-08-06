@@ -8,13 +8,15 @@ use crate::bus::{EngineEvent, EventRx, EventTx, Reporter};
 use crate::engine;
 use crate::model::{Layer, NodeId, Report, Status};
 use crate::privileged::Capabilities;
-use crate::ui::{report_tab, theme, topology};
+use crate::targets::TargetList;
+use crate::ui::{report_tab, targets_tab, theme, topology};
 
 /// Какой из разделов открыт.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Overview,
     Layers,
+    Targets,
     Report,
     About,
 }
@@ -34,6 +36,10 @@ pub struct App {
     /// Узел схемы, по которому кликнули: фильтрует список проверок.
     focus: Option<NodeId>,
     save_state: report_tab::SaveState,
+    /// Что проверять. Загружается из настроек при старте и правится
+    /// пользователем на вкладке «Цели».
+    targets: TargetList,
+    targets_editor: targets_tab::Editor,
 }
 
 impl App {
@@ -41,8 +47,11 @@ impl App {
         theme::apply(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         let caps = Capabilities::detect();
+        let targets = TargetList::load();
 
         let mut app = Self {
+            targets_editor: targets_tab::Editor::new(&targets),
+            targets,
             caps,
             tx,
             rx,
@@ -72,7 +81,11 @@ impl App {
         self.total = 0;
         self.progress_label = "Запускаю проверку…".to_string();
         self.focus = None;
-        engine::spawn(self.caps, Reporter::new(self.tx.clone()));
+        engine::spawn(
+            self.caps,
+            self.targets.clone(),
+            Reporter::new(self.tx.clone()),
+        );
     }
 
     /// Разбор накопившихся событий движка. Вызывается раз в кадр.
@@ -138,6 +151,7 @@ impl App {
             for (tab, name) in [
                 (Tab::Overview, "Схема и вывод"),
                 (Tab::Layers, "Уровни OSI"),
+                (Tab::Targets, "Цели"),
                 (Tab::Report, "Отчёт"),
                 (Tab::About, "О программе"),
             ] {
@@ -360,16 +374,29 @@ impl eframe::App for App {
             .frame(egui::Frame::new().inner_margin(12.0).fill(theme::BG))
             .show(ui, |ui| {
                 match self.tab {
-                    // У отчёта своя прокрутка: он и по ширине длинный.
+                    // У этих вкладок своя прокрутка, внешняя им мешает.
                     Tab::Report => {
                         report_tab::show(ui, &self.report, self.caps, &mut self.save_state)
+                    }
+                    Tab::Targets => {
+                        let action = targets_tab::show(
+                            ui,
+                            &mut self.targets_editor,
+                            &self.report,
+                            self.running,
+                        );
+                        if let targets_tab::Action::Apply(list) = action {
+                            self.targets = list;
+                            self.tab = Tab::Overview;
+                            self.start();
+                        }
                     }
                     _ => {
                         ScrollArea::vertical().show(ui, |ui| match self.tab {
                             Tab::Overview => self.overview(ui),
                             Tab::Layers => self.layers(ui),
                             Tab::About => self.about(ui),
-                            Tab::Report => unreachable!("обработан выше"),
+                            Tab::Report | Tab::Targets => unreachable!("обработаны выше"),
                         });
                     }
                 }

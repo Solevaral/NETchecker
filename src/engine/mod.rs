@@ -26,6 +26,7 @@ use std::time::Duration;
 use crate::bus::{EngineEvent, Reporter};
 use crate::model::{CheckResult, Diagnosis, Layer, NodeId, Status};
 use crate::privileged::Capabilities;
+use crate::targets::{Kind, Target, TargetList};
 
 use icmp::{Pinger, ReplyKind};
 use probe::{ms, tcp_connect, TcpOutcome};
@@ -36,23 +37,6 @@ const ANCHORS: [(&str, Ipv4Addr); 3] = [
     ("Cloudflare", Ipv4Addr::new(1, 1, 1, 1)),
     ("Google", Ipv4Addr::new(8, 8, 8, 8)),
     ("Яндекс", Ipv4Addr::new(77, 88, 8, 8)),
-];
-
-/// Домены для проверки прикладного уровня.
-const SITES: [&str; 2] = ["ya.ru", "example.com"];
-
-/// Сайты, на которых проверяются блокировки.
-///
-/// Список намеренно смешанный: есть заведомо доступные в России и есть те,
-/// с которыми у российских пользователей обычно бывают проблемы. Смысл именно
-/// в сравнении — если перестают открываться только вторые, причина не в
-/// подключении. Позже список станет пользовательским.
-const TARGETS: [&str; 5] = [
-    "ya.ru",
-    "example.com",
-    "www.google.com",
-    "discord.com",
-    "www.youtube.com",
 ];
 
 /// Имя, которое подставляется вместо настоящего, чтобы отделить «сервер не
@@ -72,6 +56,17 @@ const NOWHERE_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const TIMEOUT: Duration = Duration::from_secs(4);
 const PING_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// Тайм-аут проб на блокировки. Короче общего намеренно: заблокированная цель
+/// как раз и молчит, а таких целей в списке может быть много — общий тайм-аут
+/// превратил бы проверку в многоминутное ожидание.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Сколько целей проверяется одновременно.
+///
+/// Пробы почти всё время просто ждут ответа, поэтому параллельность упирается
+/// не в процессор, а в желание не устраивать провайдеру всплеск соединений.
+const PARALLEL_TARGETS: usize = 6;
+
 /// Сколько эхо-запросов шлём на один адрес: по четырём пробам уже видно
 /// и потери, и разброс задержки.
 const PING_COUNT: usize = 4;
@@ -80,11 +75,11 @@ const PING_COUNT: usize = 4;
 const STEPS: usize = 7;
 
 /// Запускает диагностику в фоне. Вызывающий продолжает рисовать окно.
-pub fn spawn(caps: Capabilities, rep: Reporter) {
-    thread::spawn(move || run(caps, &rep));
+pub fn spawn(caps: Capabilities, targets: TargetList, rep: Reporter) {
+    thread::spawn(move || run(caps, &targets, &rep));
 }
 
-fn run(caps: Capabilities, rep: &Reporter) {
+fn run(caps: Capabilities, targets: &TargetList, rep: &Reporter) {
     rep.send(EngineEvent::Started { total: STEPS });
 
     rep.progress(0, "Проверяю сетевой адаптер и роутер…");
@@ -115,11 +110,11 @@ fn run(caps: Capabilities, rep: &Reporter) {
     let route = check_route(rep, pinger.as_ref(), &link, reachable_anchor);
 
     rep.progress(5, "Проверяю имена сайтов и соединение с ними…");
-    let dns_ok = check_dns_and_sites(rep, &link);
+    let dns_ok = check_dns_and_sites(rep, &link, targets);
 
     rep.progress(6, "Проверяю блокировки…");
     let transit = if dns_ok && reachable_anchor.is_some() {
-        check_censorship(rep, &link, &bypass)
+        check_censorship(rep, &link, &bypass, targets)
     } else {
         // Без работающего интернета пробы на блокировки ничего не покажут:
         // всё будет обрываться по совсем другой причине.
@@ -481,7 +476,10 @@ fn check_route(
 }
 
 /// Разрешаются ли имена и открываются ли по ним соединения.
-fn check_dns_and_sites(rep: &Reporter, link: &l1_l2::LinkInfo) -> bool {
+///
+/// Имена берутся из пользовательского списка: проверять надо то, что не
+/// открывается у человека, а не то, что было записано в коде.
+fn check_dns_and_sites(rep: &Reporter, link: &l1_l2::LinkInfo, targets: &TargetList) -> bool {
     let servers = if link.dns_servers.is_empty() {
         "система не сообщила список".to_string()
     } else {
@@ -492,11 +490,36 @@ fn check_dns_and_sites(rep: &Reporter, link: &l1_l2::LinkInfo) -> bool {
             .join(", ")
     };
 
+    // Для проверки самого DNS хватает первых нескольких имён: если резолвер
+    // сломан, это видно сразу, а гонять весь список второй раз незачем —
+    // подробности по каждой цели даёт проверка блокировок.
+    let domains: Vec<&str> = targets
+        .items()
+        .iter()
+        .filter(|t| t.is_domain())
+        .map(|t| t.value.as_str())
+        .take(3)
+        .collect();
+
+    if domains.is_empty() {
+        rep.check(
+            CheckResult::new("l7.dns", Layer::L7Application, NodeId::Internet, "Имена сайтов")
+                .finish(
+                    Status::Skipped,
+                    "В списке целей нет ни одного имени сайта — проверять разрешение имён \
+                     не на чем. Добавьте домены на вкладке «Цели».",
+                    "Список целей состоит только из адресов.",
+                )
+                .with_evidence(format!("DNS-серверы системы: {servers}")),
+        );
+        return false;
+    }
+
     let mut resolved_any = false;
     let mut evidence = vec![format!("DNS-серверы системы: {servers}")];
 
-    for site in SITES {
-        match (site, 443u16).to_socket_addrs() {
+    for site in &domains {
+        match (*site, 443u16).to_socket_addrs() {
             Ok(addrs) => {
                 let list: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
                 if list.is_empty() {
@@ -529,7 +552,7 @@ fn check_dns_and_sites(rep: &Reporter, link: &l1_l2::LinkInfo) -> bool {
 
     // Соединение с конкретным сайтом — отдельная проверка: DNS может работать,
     // а соединение при этом обрываться.
-    let site = SITES[0];
+    let site = domains[0];
     let conn = CheckResult::new(
         "l7.site",
         Layer::L7Application,
@@ -569,6 +592,7 @@ fn check_censorship(
     rep: &Reporter,
     link: &l1_l2::LinkInfo,
     bypass: &bypass::Report,
+    targets: &TargetList,
 ) -> censorship::Transit {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(6)))
@@ -579,39 +603,62 @@ fn check_censorship(
 
     let mut probes = Vec::new();
     let mut findings = Vec::new();
+    let items = targets.items();
+    let total = items.len();
+    let mut done = 0;
 
-    for (index, domain) in TARGETS.iter().enumerate() {
+    // Цели проверяются пачками параллельно. Последовательно список из двух
+    // десятков сайтов занимал бы минуты: каждая недоступная цель — это
+    // несколько тайм-аутов подряд, и человек всё это время смотрит в пустоту.
+    for chunk in items.chunks(PARALLEL_TARGETS) {
         rep.progress(
             6,
-            format!("Проверяю блокировки: {domain} ({}/{})", index + 1, TARGETS.len()),
+            format!(
+                "Проверяю блокировки: {} ({}/{total})",
+                chunk.iter().map(|t| t.value.as_str()).collect::<Vec<_>>().join(", "),
+                done + chunk.len()
+            ),
         );
 
-        let probe = probe_target(&agent, link, domain);
-        let finding = censorship::judge(&probe);
-
-        let status = match finding.verdict {
-            censorship::Verdict::Reachable => Status::Ok,
-            censorship::Verdict::Unclear => Status::Skipped,
-            censorship::Verdict::SiteDown => Status::Warn,
-            _ => Status::Fail,
-        };
-
-        let check = CheckResult::new(
-            format!("l7.target.{}", finding.domain),
-            Layer::L7Application,
-            NodeId::Target,
-            format!("{} — {}", finding.domain, finding.verdict.headline()),
-        )
-        .finish(status, finding.simple.clone(), finding.expert.clone());
-        rep.check(
-            finding
-                .evidence
+        let batch: Vec<censorship::Probe> = thread::scope(|scope| {
+            let handles: Vec<_> = chunk
                 .iter()
-                .fold(check, |c, e| c.with_evidence(e.clone())),
-        );
+                .map(|target| scope.spawn(|| probe_target(&agent, link, target)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("проба не должна паниковать"))
+                .collect()
+        });
+        done += chunk.len();
 
-        probes.push(probe);
-        findings.push(finding);
+        for probe in batch {
+            let finding = censorship::judge(&probe);
+
+            let status = match finding.verdict {
+                censorship::Verdict::Reachable => Status::Ok,
+                censorship::Verdict::Unclear => Status::Skipped,
+                censorship::Verdict::SiteDown => Status::Warn,
+                _ => Status::Fail,
+            };
+
+            let check = CheckResult::new(
+                format!("l7.target.{}", finding.domain),
+                Layer::L7Application,
+                NodeId::Target,
+                format!("{} — {}", finding.domain, finding.verdict.headline()),
+            )
+            .finish(status, finding.simple.clone(), finding.expert.clone());
+            rep.check(
+                finding
+                    .evidence
+                    .iter()
+                    .fold(check, |c, e| c.with_evidence(e.clone())),
+            );
+
+            probes.push(probe);
+            findings.push(finding);
+        }
     }
 
     let transit = censorship::transit_signals(&probes, &findings);
@@ -660,47 +707,85 @@ fn check_censorship(
     transit
 }
 
-/// Собирает всё, что нужно знать об одном сайте.
-fn probe_target(agent: &ureq::Agent, link: &l1_l2::LinkInfo, domain: &str) -> censorship::Probe {
+/// Собирает всё, что нужно знать об одной цели.
+fn probe_target(
+    agent: &ureq::Agent,
+    link: &l1_l2::LinkInfo,
+    target: &Target,
+) -> censorship::Probe {
+    let domain = target.value.as_str();
     let mut probe = censorship::Probe::new(domain);
 
-    // Эталон: ответ, который провайдер не может подменить.
-    for endpoint in DOH_ENDPOINTS {
-        if let Ok(answer) = dns::query_doh(agent, endpoint, domain) {
-            probe.doh = Some(answer);
-            break;
-        }
-    }
+    match target.kind {
+        // У голого адреса нет имени, спрашивать DNS не о чем. Проверка имени
+        // для него тоже бессмысленна — остаётся сама доступность.
+        Kind::Address(addr) => probe.address = Some(addr),
+        Kind::Domain => {
+            // Эталон: ответ, который провайдер не может подменить.
+            for endpoint in DOH_ENDPOINTS {
+                if let Ok(answer) = dns::query_doh(agent, endpoint, domain) {
+                    probe.doh = Some(answer);
+                    break;
+                }
+            }
 
-    // Ответ того сервера, который назначила система.
-    if let Some(server) = link.dns_servers.first() {
-        probe.system_dns = dns::query_udp(*server, domain, Duration::from_secs(3)).ok();
-    }
+            // Ответ того сервера, который назначила система.
+            if let Some(server) = link.dns_servers.first() {
+                probe.system_dns = dns::query_udp(*server, domain, Duration::from_secs(3)).ok();
+            }
 
-    // Пробы идут на адрес из DoH: он заведомо настоящий.
-    probe.address = probe
-        .doh
-        .as_ref()
-        .and_then(|a| a.addresses.first().copied())
-        .or_else(|| {
-            probe
-                .system_dns
+            // Пробы идут на адрес из DoH: он заведомо настоящий.
+            probe.address = probe
+                .doh
                 .as_ref()
                 .and_then(|a| a.addresses.first().copied())
-        });
+                .or_else(|| {
+                    probe
+                        .system_dns
+                        .as_ref()
+                        .and_then(|a| a.addresses.first().copied())
+                });
+        }
+    }
 
     let Some(address) = probe.address else {
         return probe;
     };
 
     // Опорное время: быстрее этого сам сервер ответить не может.
-    if let TcpOutcome::Open { rtt } =
-        tcp_connect(SocketAddr::new(IpAddr::V4(address), 443), TIMEOUT)
-    {
-        probe.baseline = Some(rtt);
+    let endpoint = SocketAddr::new(IpAddr::V4(address), 443);
+    let mut connect = tcp_connect(endpoint, PROBE_TIMEOUT);
+    if matches!(connect, TcpOutcome::Timeout) {
+        // Короткий тайм-аут выбран ради скорости, но объявлять по нему
+        // блокировку нельзя: так же выглядит и разовая потеря пакета.
+        // Переспрашиваем с полным запасом времени — и только если снова
+        // тишина, считаем, что до адреса действительно не достучаться.
+        connect = tcp_connect(endpoint, TIMEOUT);
+    }
+    match connect {
+        TcpOutcome::Open { rtt } => probe.baseline = Some(rtt),
+        // Соединение не встало вовсе — рукопожатие даже не начнётся.
+        // Гонять три пробы по тайм-ауту каждая незачем: результат уже известен,
+        // а человек ждал бы лишние полминуты на каждой такой цели.
+        _ => {
+            let outcome = match connect {
+                TcpOutcome::Refused { rtt } => tls::Outcome::Reset { after: rtt },
+                _ => tls::Outcome::Timeout,
+            };
+            probe.real_sni = Some(outcome.clone());
+            probe.neutral_sni = Some(outcome);
+            return probe;
+        }
     }
 
-    let real = tls::probe(address, 443, domain, tls::Delivery::Whole, TIMEOUT);
+    // У цели-адреса имени нет: обе пробы шли бы с одним и тем же нейтральным
+    // именем и сравнивать было бы нечего.
+    let sni = match target.kind {
+        Kind::Domain => domain,
+        Kind::Address(_) => NEUTRAL_SNI,
+    };
+
+    let real = tls::probe(address, 443, sni, tls::Delivery::Whole, PROBE_TIMEOUT);
     let broken = real.is_broken();
     probe.real_sni = Some(real);
     probe.neutral_sni = Some(tls::probe(
@@ -708,17 +793,17 @@ fn probe_target(agent: &ureq::Agent, link: &l1_l2::LinkInfo, domain: &str) -> ce
         443,
         NEUTRAL_SNI,
         tls::Delivery::Whole,
-        TIMEOUT,
+        PROBE_TIMEOUT,
     ));
 
     // Разделять пакет имеет смысл только там, где целый не прошёл.
-    if broken {
+    if broken && target.is_domain() {
         probe.split_sni = Some(tls::probe(
             address,
             443,
             domain,
             tls::Delivery::Split,
-            TIMEOUT,
+            PROBE_TIMEOUT,
         ));
     }
 
