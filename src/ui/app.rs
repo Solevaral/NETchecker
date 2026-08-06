@@ -8,13 +8,14 @@ use crate::bus::{EngineEvent, EventRx, EventTx, Reporter};
 use crate::engine;
 use crate::model::{Layer, NodeId, Report, Status};
 use crate::privileged::Capabilities;
-use crate::ui::{theme, topology};
+use crate::ui::{report_tab, theme, topology};
 
 /// Какой из разделов открыт.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Overview,
     Layers,
+    Report,
     About,
 }
 
@@ -32,6 +33,7 @@ pub struct App {
     tab: Tab,
     /// Узел схемы, по которому кликнули: фильтрует список проверок.
     focus: Option<NodeId>,
+    save_state: report_tab::SaveState,
 }
 
 impl App {
@@ -52,6 +54,7 @@ impl App {
             expert: false,
             tab: Tab::Overview,
             focus: None,
+            save_state: report_tab::SaveState::default(),
         };
         // Первую проверку запускаем сразу: человек открыл программу именно
         // затем, чтобы узнать, что со связью.
@@ -135,6 +138,7 @@ impl App {
             for (tab, name) in [
                 (Tab::Overview, "Схема и вывод"),
                 (Tab::Layers, "Уровни OSI"),
+                (Tab::Report, "Отчёт"),
                 (Tab::About, "О программе"),
             ] {
                 if ui.selectable_label(self.tab == tab, name).clicked() {
@@ -355,11 +359,20 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(12.0).fill(theme::BG))
             .show(ui, |ui| {
-                ScrollArea::vertical().show(ui, |ui| match self.tab {
-                    Tab::Overview => self.overview(ui),
-                    Tab::Layers => self.layers(ui),
-                    Tab::About => self.about(ui),
-                });
+                match self.tab {
+                    // У отчёта своя прокрутка: он и по ширине длинный.
+                    Tab::Report => {
+                        report_tab::show(ui, &self.report, self.caps, &mut self.save_state)
+                    }
+                    _ => {
+                        ScrollArea::vertical().show(ui, |ui| match self.tab {
+                            Tab::Overview => self.overview(ui),
+                            Tab::Layers => self.layers(ui),
+                            Tab::About => self.about(ui),
+                            Tab::Report => unreachable!("обработан выше"),
+                        });
+                    }
+                }
             });
     }
 }
